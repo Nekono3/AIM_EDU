@@ -89,6 +89,18 @@ class MasterStudent(models.Model):
     grade = models.CharField(max_length=10, verbose_name=_('Grade'))
     section = models.CharField(max_length=10, verbose_name=_('Section'))
     
+    CLASS_TYPE_CHOICES = [
+        ('ru', _('RU')),
+        ('kg', _('KG')),
+    ]
+    class_type = models.CharField(
+        max_length=2,
+        choices=CLASS_TYPE_CHOICES,
+        default='ru',
+        verbose_name=_('Class Type'),
+        help_text=_('KG or RU class identifier'),
+    )
+    
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
     

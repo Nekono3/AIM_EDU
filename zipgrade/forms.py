@@ -1,4 +1,5 @@
 from django import forms
+from django.db import models
 from django.utils.translation import gettext_lazy as _
 from .models import ZipGradeExam, SubjectSplit
 from schools.models import School, Subject
@@ -59,12 +60,24 @@ class ZipGradeUploadForm(forms.Form):
         return file
 
 
+def _class_types_overlap(type_a, type_b):
+    """Return True if two class_type values could apply to the same student.
+
+    Two splits 'overlap' in audience when:
+    - either is 'all' (applies to everyone), OR
+    - both are the same specific type (both 'ru' or both 'kg').
+    """
+    if type_a == 'all' or type_b == 'all':
+        return True
+    return type_a == type_b
+
+
 class SubjectSplitForm(forms.ModelForm):
     """Form for defining subject question ranges."""
     
     class Meta:
         model = SubjectSplit
-        fields = ['subject', 'start_question', 'end_question', 'points_per_question']
+        fields = ['subject', 'start_question', 'end_question', 'points_per_question', 'class_type']
         widgets = {
             'subject': forms.Select(attrs={'class': 'form-select'}),
             'start_question': forms.NumberInput(attrs={'class': 'form-input', 'min': 1}),
@@ -74,17 +87,15 @@ class SubjectSplitForm(forms.ModelForm):
                 'step': '0.01',
                 'min': '0.01'
             }),
+            'class_type': forms.Select(attrs={'class': 'form-select'}),
         }
     
     def __init__(self, *args, exam=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.exam = exam
         
-        # Filter subjects by exam's school
-        if exam and exam.school:
-            self.fields['subject'].queryset = Subject.objects.filter(
-                models.Q(school=exam.school) | models.Q(school__isnull=True)
-            )
+        # Show all active subjects (subjects are typically shared across schools)
+        self.fields['subject'].queryset = Subject.objects.filter(is_active=True)
     
     def clean(self):
         cleaned_data = super().clean()
@@ -110,14 +121,22 @@ class SubjectSplitForm(forms.ModelForm):
                 if self.instance.pk:
                     existing_splits = existing_splits.exclude(pk=self.instance.pk)
                 
+                new_class_type = cleaned_data.get('class_type', 'all')
                 for split in existing_splits:
-                    if (start <= split.end_question and end >= split.start_question):
+                    # Ranges overlap if: new_start < existing_end AND new_end > existing_start
+                    # This allows adjacent ranges like 1-30 and 31-60.
+                    # IMPORTANT: only flag as overlap if both splits apply to the same class-type
+                    # audience (e.g. a RU-only split and a KG-only split may share the same
+                    # question numbers on purpose — they never score the same student twice).
+                    if (start < split.end_question and end > split.start_question
+                            and _class_types_overlap(new_class_type, split.class_type)):
                         raise forms.ValidationError(
-                            _('Question range overlaps with existing split: %(subject)s (Q%(start)s-Q%(end)s)') %
+                            _('Question range overlaps with existing split: %(subject)s (Q%(start)s-Q%(end)s) [%(ctype)s]') %
                             {
                                 'subject': split.subject.name,
                                 'start': split.start_question,
-                                'end': split.end_question
+                                'end': split.end_question,
+                                'ctype': split.get_class_type_display(),
                             }
                         )
         

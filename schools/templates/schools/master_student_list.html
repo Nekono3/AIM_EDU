@@ -19,7 +19,8 @@
     <form method="get" class="filter-form">
         <div class="filter-row">
             <div class="filter-group">
-                <input type="text" name="search" class="form-input" placeholder="{% trans 'Search...' %}" value="{{ search }}">
+                <input type="text" name="search" class="form-input" placeholder="{% trans 'Search...' %}"
+                    value="{{ search }}">
             </div>
             <div class="filter-group">
                 <select name="school" class="form-input">
@@ -37,6 +38,13 @@
                     {% endfor %}
                 </select>
             </div>
+            <div class="filter-group">
+                <select name="class_type" class="form-input">
+                    <option value="">{% trans "All Types" %}</option>
+                    <option value="ru" {% if class_type_filter == 'ru' %}selected{% endif %}>RU</option>
+                    <option value="kg" {% if class_type_filter == 'kg' %}selected{% endif %}>KG</option>
+                </select>
+            </div>
             <button type="submit" class="btn btn-primary">{% trans "Filter" %}</button>
         </div>
     </form>
@@ -50,6 +58,7 @@
                     <th>{% trans "Student ID" %}</th>
                     <th>{% trans "Full Name" %}</th>
                     <th>{% trans "Grade" %}</th>
+                    <th>{% trans "Type" %}</th>
                     <th>{% trans "School" %}</th>
                     <th>{% trans "Actions" %}</th>
                 </tr>
@@ -60,15 +69,23 @@
                     <td><code>{{ student.student_id }}</code></td>
                     <td><strong>{{ student.surname }} {{ student.name }}</strong></td>
                     <td>{{ student.grade }}{{ student.section }}</td>
+                    <td>
+                        <span
+                            class="badge {% if student.class_type == 'kg' %}badge-warning{% else %}badge-info{% endif %}">
+                            {{ student.get_class_type_display }}
+                        </span>
+                    </td>
                     <td>{{ student.school.name }}</td>
                     <td>
-                        <a href="{% url 'schools:master_student_edit' student.pk %}" class="btn btn-sm btn-outline">Edit</a>
-                        <a href="{% url 'schools:master_student_delete' student.pk %}" class="btn btn-sm btn-outline btn-danger">Del</a>
+                        <a href="{% url 'schools:master_student_edit' student.pk %}"
+                            class="btn btn-sm btn-outline">Edit</a>
+                        <a href="{% url 'schools:master_student_delete' student.pk %}"
+                            class="btn btn-sm btn-outline btn-danger">Del</a>
                     </td>
                 </tr>
                 {% empty %}
                 <tr>
-                    <td colspan="5" class="text-center text-muted">{% trans "No students found." %}</td>
+                    <td colspan="6" class="text-center text-muted">{% trans "No students found." %}</td>
                 </tr>
                 {% endfor %}
             </tbody>

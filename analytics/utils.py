@@ -1,4 +1,5 @@
 from django.db.models import Avg, Count, Max, Min, Q, Sum
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 from openpyxl.utils import get_column_letter
 from exams.models import ExamAttempt, OnlineExam
@@ -262,15 +263,18 @@ class AnalyticsHelper:
             }
         
         stats = results.aggregate(
-            avg=Avg('percentage'),
-            max=Max('percentage'),
-            min=Min('percentage'),
+            avg=Avg(Coalesce('class_type_percentage', 'percentage')),
+            max=Max(Coalesce('class_type_percentage', 'percentage')),
+            min=Min(Coalesce('class_type_percentage', 'percentage')),
             total=Count('id')
         )
         
         # Calculate pass rate (60% as passing threshold)
         passing_threshold = 60
-        passed = results.filter(percentage__gte=passing_threshold).count()
+        passed = results.filter(
+            Q(class_type_percentage__gte=passing_threshold) |
+            Q(class_type_percentage__isnull=True, percentage__gte=passing_threshold)
+        ).count()
         pass_rate = (passed / stats['total']) * 100 if stats['total'] > 0 else 0
         
         # Get exam info
@@ -304,7 +308,8 @@ class AnalyticsHelper:
         
         results = ExamResult.objects.filter(
             exam_id__in=exam_ids,
-            student__isnull=False
+            student__isnull=False,
+            student__school=school
         ).select_related('student')
         
         # Group by class (grade + section)
@@ -318,10 +323,12 @@ class AnalyticsHelper:
                         'section': result.student.section,
                         'name': key,
                         'scores': [],
-                        'student_count': 0
+                        'student_ids': set()
                     }
-                class_stats[key]['scores'].append(float(result.percentage))
-                class_stats[key]['student_count'] += 1
+                class_stats[key]['scores'].append(
+                    float(result.class_type_percentage if result.class_type_percentage is not None else result.percentage)
+                )
+                class_stats[key]['student_ids'].add(result.student_id)
         
         # Calculate averages
         breakdown = []
@@ -334,7 +341,7 @@ class AnalyticsHelper:
                 'name': data['name'],
                 'grade': data['grade'],
                 'section': data['section'],
-                'student_count': data['student_count'],
+                'student_count': len(data['student_ids']),
                 'avg_score': round(avg_score, 1),
                 'pass_rate': round(pass_rate, 1),
                 'max_score': round(max(data['scores']) if data['scores'] else 0, 1),
@@ -426,7 +433,9 @@ class AnalyticsHelper:
                     'scores': [],
                     'exams_taken': 0
                 }
-            student_stats[key]['scores'].append(float(result.percentage))
+            student_stats[key]['scores'].append(
+                float(result.class_type_percentage if result.class_type_percentage is not None else result.percentage)
+            )
             student_stats[key]['exams_taken'] += 1
         
         # Calculate averages and sort
@@ -511,350 +520,738 @@ class AnalyticsHelper:
             
         return labels, data
 
+    @staticmethod
+    def get_performance_distribution(exam_ids):
+        """Get student performance distribution for PieChart.
+        
+        Categories:
+        - Excellent: 80-100%
+        - Good: 60-79%
+        - Satisfactory: 50-59%
+        - Unsatisfactory: 0-49%
+        """
+        from zipgrade.models import ExamResult
+        from django.utils.translation import gettext as _
+        
+        if not exam_ids:
+            return [], []
+        
+        results = ExamResult.objects.filter(exam_id__in=exam_ids)
+        
+        if not results.exists():
+            return [], []
+        
+        # Count results in each category
+        excellent = 0      # 80-100%
+        good = 0           # 60-79%
+        satisfactory = 0   # 50-59%
+        unsatisfactory = 0 # 0-49%
+        
+        for result in results:
+            percentage = float(result.class_type_percentage if result.class_type_percentage is not None else result.percentage)
+            if percentage >= 80:
+                excellent += 1
+            elif percentage >= 60:
+                good += 1
+            elif percentage >= 50:
+                satisfactory += 1
+            else:
+                unsatisfactory += 1
+        
+        labels = [
+            _('Excellent (80-100%)'),
+            _('Good (60-79%)'),
+            _('Satisfactory (50-59%)'),
+            _('Unsatisfactory (0-49%)')
+        ]
+        data = [excellent, good, satisfactory, unsatisfactory]
+        
+        return labels, data
+
+    @staticmethod
+    def get_class_performance_distribution(exam_ids, grade, section):
+        """Get performance distribution for a specific class in ZipGrade exams.
+        
+        Categories:
+        - Excellent: 80-100%
+        - Good: 60-79%
+        - Satisfactory: 50-59%
+        - Unsatisfactory: 0-49%
+        """
+        from zipgrade.models import ExamResult
+        from django.utils.translation import gettext as _
+        
+        if not exam_ids:
+            return [], []
+        
+        results = ExamResult.objects.filter(
+            exam_id__in=exam_ids,
+            student__grade=grade,
+            student__section=section
+        )
+        
+        if not results.exists():
+            return [], []
+        
+        excellent = 0
+        good = 0
+        satisfactory = 0
+        unsatisfactory = 0
+        
+        for result in results:
+            percentage = float(result.class_type_percentage if result.class_type_percentage is not None else result.percentage)
+            if percentage >= 80:
+                excellent += 1
+            elif percentage >= 60:
+                good += 1
+            elif percentage >= 50:
+                satisfactory += 1
+            else:
+                unsatisfactory += 1
+        
+        labels = [
+            _('Excellent (80-100%)'),
+            _('Good (60-79%)'),
+            _('Satisfactory (50-59%)'),
+            _('Unsatisfactory (0-49%)')
+        ]
+        data = [excellent, good, satisfactory, unsatisfactory]
+        
+        return labels, data
+
+    @staticmethod
+    def get_class_ranked_students(exam_ids, grade, section):
+        """Get all students in a class ranked by average ZipGrade score (highest first).
+        
+        Returns list of dicts: [{name, avg_score, exam_count, percentage}, ...]
+        """
+        from zipgrade.models import ExamResult
+        from django.db.models import Avg, Count
+        
+        if not exam_ids or not grade or not section:
+            return []
+        
+        # Aggregate by student: average percentage and count of exams
+        student_stats = (
+            ExamResult.objects.filter(
+                exam_id__in=exam_ids,
+                student__grade=grade,
+                student__section=section,
+                student__isnull=False
+            )
+            .values('student__id', 'student__name', 'student__surname')
+            .annotate(
+                avg_score=Avg(Coalesce('class_type_percentage', 'percentage')),
+                exam_count=Count('id')
+            )
+            .order_by('-avg_score')
+        )
+        
+        ranked = []
+        for i, s in enumerate(student_stats, 1):
+            ranked.append({
+                'rank': i,
+                'name': f"{s['student__surname']} {s['student__name']}".strip(),
+                'avg_score': round(float(s['avg_score']), 1),
+                'exam_count': s['exam_count'],
+            })
+        
+        return ranked
+
+    @staticmethod
+    def get_class_subject_breakdown(exam_ids, grade, section):
+        """Get subject breakdown for a specific class in selected ZipGrade exams.
+        
+        Returns list of subjects sorted by average score (best performing first).
+        Used for pie chart showing which subjects the class excels at.
+        """
+        from zipgrade.models import SubjectResult, ExamResult
+        
+        if not exam_ids or not grade or not section:
+            return [], []
+        
+        # Get all exam results for students in this class
+        class_results = ExamResult.objects.filter(
+            exam_id__in=exam_ids,
+            student__grade=grade,
+            student__section=section
+        ).values_list('id', flat=True)
+        
+        if not class_results:
+            return [], []
+        
+        # Get subject results for these exam results
+        subject_results = SubjectResult.objects.filter(
+            result_id__in=class_results
+        ).select_related('subject_split__subject')
+        
+        if not subject_results.exists():
+            return [], []
+        
+        # Group by subject and calculate averages
+        subject_stats = {}
+        for sr in subject_results:
+            subject_name = sr.subject_split.subject.name
+            if subject_name not in subject_stats:
+                subject_stats[subject_name] = {'scores': []}
+            subject_stats[subject_name]['scores'].append(float(sr.percentage))
+        
+        # Calculate averages and build result
+        breakdown = []
+        for name, data in subject_stats.items():
+            avg = sum(data['scores']) / len(data['scores']) if data['scores'] else 0
+            breakdown.append({
+                'name': name,
+                'avg_score': round(avg, 1)
+            })
+        
+        # Sort by average score descending (best subjects first)
+        breakdown.sort(key=lambda x: x['avg_score'], reverse=True)
+        
+        # Return labels and data for pie chart
+        labels = [s['name'] for s in breakdown]
+        data = [s['avg_score'] for s in breakdown]
+        
+        return labels, data
+
 
 class ReportGenerator:
+
+
     """Helper for generating analytic reports."""
     
+    # Unicode font name constant — used in table styles and paragraphs
+    UNICODE_FONT = 'LiberationSans'
+    UNICODE_FONT_BOLD = 'LiberationSans-Bold'
+    
     @staticmethod
-    def generate_excel_report(school):
-        """Generate Excel report for school analytics."""
-        import openpyxl
-        from openpyxl.styles import Font, Alignment
-        from django.http import HttpResponse
+    def _register_unicode_fonts():
+        """Register Unicode-capable fonts for PDF generation.
         
-        wb = openpyxl.Workbook()
-        ws = wb.active
-        ws.title = "School Analytics"
+        Returns (font_name, font_name_bold) tuple.
+        Falls back to Helvetica if LiberationSans not available.
+        """
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        import os
         
-        # Header
-        ws['A1'] = f"Analytics Report: {school.name}"
-        ws['A1'].font = Font(size=14, bold=True)
-        ws.merge_cells('A1:D1')
+        font_dir = '/usr/share/fonts/liberation'
+        regular = os.path.join(font_dir, 'LiberationSans-Regular.ttf')
+        bold = os.path.join(font_dir, 'LiberationSans-Bold.ttf')
+        italic = os.path.join(font_dir, 'LiberationSans-Italic.ttf')
         
-        ws['A3'] = "Generated at:"
-        ws['B3'] = timezone.now().strftime("%Y-%m-%d %H:%M")
+        if os.path.exists(regular):
+            try:
+                pdfmetrics.registerFont(TTFont('LiberationSans', regular))
+                if os.path.exists(bold):
+                    pdfmetrics.registerFont(TTFont('LiberationSans-Bold', bold))
+                if os.path.exists(italic):
+                    pdfmetrics.registerFont(TTFont('LiberationSans-Italic', italic))
+                return 'LiberationSans', 'LiberationSans-Bold'
+            except Exception:
+                pass
         
-        # Stats
-        stats = AnalyticsHelper.get_school_stats(school)['online_exams']
-        
-        ws['A5'] = "Overview"
-        ws['A5'].font = Font(bold=True)
-        
-        data = [
-            ("Total Exams Taken", stats['count']),
-            ("Average Score", f"{stats['avg_score']}%"),
-            ("Pass Rate", f"{stats['pass_rate']}%"),
-            ("Best Score", f"{stats['max_score']}%"),
-        ]
-        
-        row = 6
-        for label, value in data:
-            ws.cell(row=row, column=1, value=label)
-            ws.cell(row=row, column=2, value=value)
-            row += 1
-            
-        # Subject Performance
-        row += 2
-        ws.cell(row=row, column=1, value="Subject Performance").font = Font(bold=True)
-        row += 1
-        headers = ["Subject", "Total Exams", "Avg Score", "Pass Rate"]
-        for col, h in enumerate(headers, 1):
-             ws.cell(row=row, column=col, value=h).font = Font(bold=True)
-        row += 1
-        
-        subject_stats = AnalyticsHelper.get_online_exam_subject_performance(school)
-        for subj in subject_stats:
-            ws.cell(row=row, column=1, value=subj['name'])
-            ws.cell(row=row, column=2, value=subj['count'])
-            ws.cell(row=row, column=3, value=f"{subj['avg_score']}%")
-            ws.cell(row=row, column=4, value=f"{subj['pass_rate']}%")
-            row += 1
-            
-        # Recent Activity
-        ws.cell(row=row+2, column=1, value="Recent Exams").font = Font(bold=True)
-        row += 3
-        
-        headers = ["Title", "Subject", "Created By", "Date"]
-        for col, h in enumerate(headers, 1):
-            cell = ws.cell(row=row, column=col, value=h)
-            cell.font = Font(bold=True)
-            
-        exams = OnlineExam.objects.filter(school=school).order_by('-created_at')[:20]
-        row += 1
-        for exam in exams:
-            ws.cell(row=row, column=1, value=exam.title)
-            ws.cell(row=row, column=2, value=exam.subject.name)
-            ws.cell(row=row, column=3, value=exam.created_by.get_full_name())
-            ws.cell(row=row, column=4, value=exam.created_at.strftime("%Y-%m-%d"))
-            row += 1
-            
-        # Auto-adjust columns
-        for col in ws.columns:
-            max_length = 0
-            column = get_column_letter(col[0].column)
-            for cell in col:
-                try:
-                    if len(str(cell.value)) > max_length:
-                        max_length = len(str(cell.value))
-                except:
-                    pass
-            adjusted_width = (max_length + 2)
-            ws.column_dimensions[column].width = adjusted_width
-            
-        response = HttpResponse(content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-        response['Content-Disposition'] = f'attachment; filename=analytics_{school.pk}_{timezone.now().date()}.xlsx'
-        wb.save(response)
-        return response
-
+        return 'Helvetica', 'Helvetica-Bold'
+    
     @staticmethod
-    def generate_pdf_report(school):
-        """Generate PDF report for school analytics."""
-        from reportlab.lib import colors
-        from reportlab.lib.pagesizes import letter
-        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    def _get_unicode_styles():
+        """Get stylesheet with Unicode font applied to all styles."""
         from reportlab.lib.styles import getSampleStyleSheet
-        from django.http import HttpResponse
-        import io
         
-        buffer = io.BytesIO()
-        doc = SimpleDocTemplate(buffer, pagesize=letter)
-        elements = []
+        font_name, font_bold = ReportGenerator._register_unicode_fonts()
         styles = getSampleStyleSheet()
         
-        # Title
-        elements.append(Paragraph(f"Analytics Report: {school.name}", styles['Title']))
-        elements.append(Paragraph(f"Date: {timezone.now().strftime('%Y-%m-%d')}", styles['Normal']))
-        elements.append(Spacer(1, 20))
+        # Override default fonts with Unicode-capable font
+        for style_name in styles.byName:
+            style = styles[style_name]
+            if hasattr(style, 'fontName'):
+                if 'Bold' in style.fontName or 'bold' in style.fontName.lower():
+                    style.fontName = font_bold
+                else:
+                    style.fontName = font_name
         
-        # Stats Table
-        stats = AnalyticsHelper.get_school_stats(school)['online_exams']
-        data = [
-            ["Metric", "Value"],
-            ["Total Exams Taken", str(stats['count'])],
-            ["Average Score", f"{stats['avg_score']}%"],
-            ["Pass Rate", f"{stats['pass_rate']}%"],
-            ["Best Score", f"{stats['max_score']}%"],
+        return styles, font_name, font_bold
+    
+    @staticmethod
+    def _get_performance_category(percentage):
+        """Return performance category string from percentage."""
+        if percentage >= 80:
+            return 'Excellent'
+        elif percentage >= 60:
+            return 'Good'
+        elif percentage >= 50:
+            return 'Satisfactory'
+        return 'Unsatisfactory'
+
+    @staticmethod
+    def _build_pie_chart(perf_dist, font_name):
+        """Build a performance distribution pie chart Drawing."""
+        from reportlab.graphics.shapes import Drawing, String, Rect
+        from reportlab.graphics.charts.piecharts import Pie
+        from reportlab.lib import colors as c
+
+        cat_colors = [
+            c.HexColor('#27ae60'),  # Excellent - Green
+            c.HexColor('#2980b9'),  # Good - Blue
+            c.HexColor('#f39c12'),  # Satisfactory - Orange
+            c.HexColor('#e74c3c'),  # Unsatisfactory - Red
         ]
-        
-        t = Table(data)
-        t.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (1, 0), colors.grey),
-            ('TEXTCOLOR', (0, 0), (1, 0), colors.whitesmoke),
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-            ('GRID', (0, 0), (-1, -1), 1, colors.black),
-        ]))
-        elements.append(t)
-        elements.append(Spacer(1, 20))
-        
-        # Growth Chart
+        cat_names = ['Excellent (80-100)', 'Good (60-79)', 'Satisfactory (50-59)', 'Unsatisfactory (0-49)']
+
+        ordered_keys = [
+            'Excellent (80-100%)', 'Good (60-79%)',
+            'Satisfactory (50-59%)', 'Unsatisfactory (0-49%)',
+        ]
+        values = []
+        for k in ordered_keys:
+            found = False
+            for dk, dv in perf_dist.items():
+                if 'Excellent' in str(dk) or '80' in str(dk):
+                    if k == ordered_keys[0]:
+                        values.append(int(dv)); found = True; break
+                elif 'Good' in str(dk) or '60' in str(dk):
+                    if k == ordered_keys[1]:
+                        values.append(int(dv)); found = True; break
+                elif 'Satisfactory' in str(dk) and 'Un' not in str(dk):
+                    if k == ordered_keys[2]:
+                        values.append(int(dv)); found = True; break
+                elif 'Unsatisfactory' in str(dk) or '0-49' in str(dk):
+                    if k == ordered_keys[3]:
+                        values.append(int(dv)); found = True; break
+            if not found:
+                values.append(0)
+
+        total = sum(values)
+        if total == 0:
+            return None
+
+        d = Drawing(500, 220)
+        pie = Pie()
+        pie.x = 30
+        pie.y = 20
+        pie.width = 180
+        pie.height = 180
+        pie.data = values
+        pie.labels = None
+        pie.sideLabels = False
+
+        for i, col in enumerate(cat_colors):
+            pie.slices[i].fillColor = col
+            pie.slices[i].strokeColor = c.white
+            pie.slices[i].strokeWidth = 1
+
+        d.add(pie)
+
+        # Legend
+        legend_x = 240
+        legend_y = 170
+        for i, name in enumerate(cat_names):
+            y = legend_y - i * 30
+            pct = round(values[i] / total * 100, 1) if total else 0
+            d.add(Rect(legend_x, y, 14, 14, fillColor=cat_colors[i], strokeColor=None))
+            d.add(String(legend_x + 20, y + 2, f"{name}: {values[i]} ({pct}%)",
+                         fontName=font_name, fontSize=9))
+
+        return d
+
+    @staticmethod
+    def _build_bar_chart(subject_labels, subject_data, font_name):
+        """Build a best performing subjects bar chart Drawing."""
         from reportlab.graphics.shapes import Drawing
-        from reportlab.graphics.charts.linecharts import HorizontalLineChart
-        
-        elements.append(Paragraph("Exam Growth (Last 12 Weeks)", styles['Heading2']))
-        labels, values = AnalyticsHelper.get_growth_chart_data(school)
-        
-        if values:
-            d = Drawing(400, 200)
-            lc = HorizontalLineChart()
-            lc.x = 30
-            lc.y = 50
-            lc.height = 125
-            lc.width = 350
-            lc.data = [values]
-            lc.categoryAxis.categoryNames = labels
-            lc.categoryAxis.labels.boxAnchor = 'n'
-            lc.categoryAxis.labels.angle = 30
-            lc.categoryAxis.labels.dy = -10
-            lc.valueAxis.valueMin = 0
-            lc.valueAxis.valueMax = max(values) + (5 if max(values) > 0 else 5)
-            lc.valueAxis.valueStep = 5 if lc.valueAxis.valueMax > 15 else (1 if lc.valueAxis.valueMax < 5 else 2)
-            d.add(lc)
-            elements.append(d)
-            elements.append(Spacer(1, 20))
-        
-        doc.build(elements)
-        buffer.seek(0)
-        
-        response = HttpResponse(buffer, content_type='application/pdf')
-        response['Content-Disposition'] = f'attachment; filename=analytics_{school.pk}_{timezone.now().date()}.pdf'
-        return response
+        from reportlab.graphics.charts.barcharts import VerticalBarChart
+        from reportlab.lib import colors as c
+
+        if not subject_labels or not subject_data:
+            return None
+
+        chart_colors = [
+            c.HexColor('#3498db'), c.HexColor('#2ecc71'), c.HexColor('#e74c3c'),
+            c.HexColor('#f39c12'), c.HexColor('#9b59b6'), c.HexColor('#1abc9c'),
+            c.HexColor('#e67e22'), c.HexColor('#34495e'),
+        ]
+
+        d = Drawing(500, 220)
+        bc = VerticalBarChart()
+        bc.x = 50
+        bc.y = 40
+        bc.height = 150
+        bc.width = 420
+        bc.data = [subject_data]
+        bc.categoryAxis.categoryNames = [s[:15] for s in subject_labels]
+        bc.categoryAxis.labels.boxAnchor = 'ne'
+        bc.categoryAxis.labels.angle = 30
+        bc.categoryAxis.labels.dy = -5
+        bc.categoryAxis.labels.fontName = font_name
+        bc.categoryAxis.labels.fontSize = 7
+        bc.valueAxis.valueMin = 0
+        bc.valueAxis.valueMax = 100
+        bc.valueAxis.valueStep = 20
+        bc.valueAxis.labels.fontName = font_name
+
+        for i in range(len(subject_data)):
+            bc.bars[0].fillColor = chart_colors[i % len(chart_colors)]
+
+        # Color each bar individually
+        for i in range(len(subject_data)):
+            idx = i % len(chart_colors)
+            bc.bars[(0, i)].fillColor = chart_colors[idx]
+
+        d.add(bc)
+        return d
 
     @staticmethod
-    def generate_class_excel_report(school, grade, section):
-        """Generate Excel report for class analytics."""
+    def generate_excel_report(report_data):
+        """Generate simplified Excel report — single sheet with student ranking."""
         import openpyxl
-        from openpyxl.styles import Font
+        from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
         from django.http import HttpResponse
-        
+
         wb = openpyxl.Workbook()
         ws = wb.active
-        ws.title = f"Class {grade}{section} Analytics"
-        
+        ws.title = "Student Rankings"
+
+        school_name = report_data.get('school_name', 'School')
+        ranked_students = report_data.get('ranked_students', [])
+
         # Header
-        ws['A1'] = f"Class Analytics Report: {grade}{section}"
+        ws['A1'] = f"Student Rankings — {school_name}"
         ws['A1'].font = Font(size=14, bold=True)
-        ws.merge_cells('A1:D1')
-        
-        ws['A2'] = f"School: {school.name}"
-        ws['A3'] = f"Generated: {timezone.now().strftime('%Y-%m-%d %H:%M')}"
-        
-        # Stats
-        stats = AnalyticsHelper.get_class_stats(school, grade, section)
-        
-        ws['A5'] = "Overview"
-        ws['A5'].font = Font(bold=True)
-        
-        data = [
-            ("Total Students", stats['total_students']),
-            ("Total Exams Taken", stats['total_exams']),
-            ("Average Score", f"{stats['avg_score']}%"),
-            ("Pass Rate", f"{stats['pass_rate']}%"),
-            ("Best Score", f"{stats['max_score']}%"),
-            ("Lowest Score", f"{stats['min_score']}%"),
-        ]
-        
-        row = 6
-        for label, value in data:
-            ws.cell(row=row, column=1, value=label)
-            ws.cell(row=row, column=2, value=value)
-            row += 1
-        
-        # Top students
-        if stats['top_students']:
-            row += 2
-            ws.cell(row=row, column=1, value="Top Performers").font = Font(bold=True)
-            row += 1
-            headers = ["#", "Student Name", "Avg Score", "Exams"]
-            for col, h in enumerate(headers, 1):
-                ws.cell(row=row, column=col, value=h).font = Font(bold=True)
-            row += 1
-            for i, student in enumerate(stats['top_students'], 1):
-                ws.cell(row=row, column=1, value=i)
-                ws.cell(row=row, column=2, value=f"{student['student__first_name']} {student['student__last_name']}")
-                ws.cell(row=row, column=3, value=f"{round(student['avg_score'], 1)}%")
-                ws.cell(row=row, column=4, value=student['exams_taken'])
-                row += 1
-        
+        ws.merge_cells('A1:E1')
+        ws['A2'] = f"Generated: {timezone.now().strftime('%Y-%m-%d %H:%M')}"
+        ws['A2'].font = Font(size=9, italic=True)
+
+        # Column Headers
+        headers = ["Rank", "Student Name", "Score", "Percentage", "Performance"]
+        header_fill = PatternFill(start_color="1a1a2e", end_color="1a1a2e", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF", size=10)
+        thin_border = Border(
+            left=Side(style='thin'), right=Side(style='thin'),
+            top=Side(style='thin'), bottom=Side(style='thin'),
+        )
+
+        for col, h in enumerate(headers, 1):
+            cell = ws.cell(row=4, column=col, value=h)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal='center')
+            cell.border = thin_border
+
+        # Data rows
+        for i, s in enumerate(ranked_students):
+            row = 5 + i
+            pct = s.get('avg_score', s.get('percentage', 0))
+            perf = ReportGenerator._get_performance_category(pct)
+            ws.cell(row=row, column=1, value=s.get('rank', i + 1)).alignment = Alignment(horizontal='center')
+            ws.cell(row=row, column=2, value=s.get('name', ''))
+            ws.cell(row=row, column=3, value=f"{pct}%")
+            ws.cell(row=row, column=4, value=f"{pct}%")
+            ws.cell(row=row, column=5, value=perf)
+            for c in range(1, 6):
+                ws.cell(row=row, column=c).border = thin_border
+
         # Auto-adjust columns
-        for col in ws.columns:
-            max_length = 0
-            column = get_column_letter(col[0].column)
-            for cell in col:
-                try:
-                    if len(str(cell.value)) > max_length:
-                        max_length = len(str(cell.value))
-                except:
-                    pass
-            ws.column_dimensions[column].width = max_length + 2
-        
+        widths = [8, 35, 12, 14, 20]
+        for i, w in enumerate(widths, 1):
+            ws.column_dimensions[get_column_letter(i)].width = w
+
         response = HttpResponse(content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
-        response['Content-Disposition'] = f'attachment; filename=class_{grade}{section}_{timezone.now().date()}.xlsx'
+        safe_name = school_name.replace(' ', '_')[:30]
+        response['Content-Disposition'] = f'attachment; filename=rankings_{safe_name}_{timezone.now().date()}.xlsx'
         wb.save(response)
         return response
 
     @staticmethod
-    def generate_class_pdf_report(school, grade, section):
-        """Generate PDF report for class analytics."""
+    def generate_pdf_report(report_data):
+        """Generate professional PDF report with charts and student ranking.
+
+        report_data dict contains:
+            - source, school_name, stats, subject_name
+            - performance_distribution: dict {label: count}
+            - subject_labels, subject_data: for bar chart
+            - ranked_students: list of dicts
+        """
         from reportlab.lib import colors
         from reportlab.lib.pagesizes import letter
+        from reportlab.lib.units import inch
         from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-        from reportlab.lib.styles import getSampleStyleSheet
         from django.http import HttpResponse
         import io
-        
+
         buffer = io.BytesIO()
-        doc = SimpleDocTemplate(buffer, pagesize=letter)
+        doc = SimpleDocTemplate(buffer, pagesize=letter, topMargin=0.5*inch, bottomMargin=0.5*inch)
         elements = []
-        styles = getSampleStyleSheet()
-        
-        # Title
-        elements.append(Paragraph(f"Class Analytics Report: {grade}{section}", styles['Title']))
-        elements.append(Paragraph(f"School: {school.name}", styles['Normal']))
-        elements.append(Paragraph(f"Date: {timezone.now().strftime('%Y-%m-%d')}", styles['Normal']))
-        elements.append(Spacer(1, 20))
-        
-        # Stats
-        stats = AnalyticsHelper.get_class_stats(school, grade, section)
-        data = [
-            ["Metric", "Value"],
-            ["Total Students", str(stats['total_students'])],
-            ["Total Exams Taken", str(stats['total_exams'])],
-            ["Average Score", f"{stats['avg_score']}%"],
-            ["Pass Rate", f"{stats['pass_rate']}%"],
-            ["Best Score", f"{stats['max_score']}%"],
-            ["Lowest Score", f"{stats['min_score']}%"],
-        ]
-        
-        t = Table(data)
-        t.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (1, 0), colors.grey),
-            ('TEXTCOLOR', (0, 0), (1, 0), colors.whitesmoke),
+        styles, font_name, font_bold = ReportGenerator._get_unicode_styles()
+
+        source = report_data.get('source', 'exams')
+        school_name = report_data.get('school_name', 'Unknown')
+        stats = report_data.get('stats', {})
+        subject_name = report_data.get('subject_name', '')
+
+        header_style = TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1a1a2e')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
             ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-            ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
-            ('GRID', (0, 0), (-1, -1), 1, colors.black),
+            ('FONTNAME', (0, 0), (-1, 0), font_bold),
+            ('FONTNAME', (0, 1), (-1, -1), font_name),
+            ('FONTSIZE', (0, 0), (-1, 0), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
+            ('TOPPADDING', (0, 0), (-1, 0), 10),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#f8f9fa')),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#dee2e6')),
+            ('FONTSIZE', (0, 1), (-1, -1), 9),
+            ('TOPPADDING', (0, 1), (-1, -1), 6),
+            ('BOTTOMPADDING', (0, 1), (-1, -1), 6),
+        ])
+
+        # ── Header Information ──
+        source_label = 'ZipGrade' if source == 'zipgrade' else 'Online Exams'
+        elements.append(Paragraph(f"Analytics Report", styles['Title']))
+        header_info = [
+            ["School", school_name],
+            ["Source", source_label],
+        ]
+        if subject_name:
+            header_info.append(["Subject", subject_name])
+        header_info.append(["Total Students", str(stats.get('count', 0))])
+        header_info.append(["Average Score", f"{stats.get('avg_score', 0)}%"])
+        header_info.append(["Pass Rate", f"{stats.get('pass_rate', 0)}%"])
+        header_info.append(["Date Generated", timezone.now().strftime('%Y-%m-%d %H:%M')])
+
+        ht = Table(header_info, colWidths=[2*inch, 4*inch])
+        ht.setStyle(TableStyle([
+            ('FONTNAME', (0, 0), (0, -1), font_bold),
+            ('FONTNAME', (1, 0), (1, -1), font_name),
+            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('TOPPADDING', (0, 0), (-1, -1), 4),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+            ('LINEBELOW', (0, -1), (-1, -1), 1, colors.HexColor('#1a1a2e')),
         ]))
-        elements.append(t)
-        elements.append(Spacer(1, 20))
-        
-        # Top students
-        if stats['top_students']:
-            elements.append(Paragraph("Top Performers", styles['Heading2']))
-            top_data = [["#", "Student Name", "Avg Score", "Exams"]]
-            for i, student in enumerate(stats['top_students'], 1):
-                top_data.append([
-                    str(i),
-                    f"{student['student__first_name']} {student['student__last_name']}",
-                    f"{round(student['avg_score'], 1)}%",
-                    str(student['exams_taken'])
-                ])
-            t2 = Table(top_data)
-            t2.setStyle(TableStyle([
-                ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
-                ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-                ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                ('GRID', (0, 0), (-1, -1), 1, colors.black),
-            ]))
-            elements.append(t2)
+        elements.append(ht)
+        elements.append(Spacer(1, 25))
+
+        # ── Performance Distribution Chart ──
+        perf_dist = report_data.get('performance_distribution', {})
+        if perf_dist:
+            elements.append(Paragraph("Performance Distribution", styles['Heading2']))
+            pie_drawing = ReportGenerator._build_pie_chart(perf_dist, font_name)
+            if pie_drawing:
+                elements.append(pie_drawing)
             elements.append(Spacer(1, 20))
-            
-            # Top Students Chart
-            from reportlab.graphics.shapes import Drawing
-            from reportlab.graphics.charts.barcharts import HorizontalBarChart
-            
-            elements.append(Paragraph("Top Performers Chart", styles['Heading2']))
-            
-            student_names = [f"{s['student__first_name']} {s['student__last_name'][:1]}." for s in stats['top_students']]
-            scores = [s['avg_score'] for s in stats['top_students']]
-            
-            if scores:
-                d = Drawing(400, 200)
-                bc = HorizontalBarChart()
-                bc.x = 100
-                bc.y = 50
-                bc.height = 125
-                bc.width = 300
-                bc.data = [scores]
-                bc.categoryAxis.categoryNames = student_names
-                bc.categoryAxis.labels.boxAnchor = 'e'
-                bc.categoryAxis.labels.dx = -5
-                bc.valueAxis.valueMin = 0
-                bc.valueAxis.valueMax = 100
-                bc.valueAxis.valueStep = 20
-                d.add(bc)
-                elements.append(d)
-                elements.append(Spacer(1, 20))
-        
+
+        # ── Best Performing Subjects Chart ──
+        subj_labels = report_data.get('subject_labels', [])
+        subj_data = report_data.get('subject_data', [])
+        if subj_labels and subj_data:
+            elements.append(Paragraph("Best Performing Subjects", styles['Heading2']))
+            bar_drawing = ReportGenerator._build_bar_chart(subj_labels, subj_data, font_name)
+            if bar_drawing:
+                elements.append(bar_drawing)
+            elements.append(Spacer(1, 20))
+
+        # ── Student Ranking Table ──
+        ranked = report_data.get('ranked_students', [])
+        if ranked:
+            elements.append(Paragraph("Student Rankings", styles['Heading2']))
+            rank_data = [["Rank", "Student Name", "Score", "Percentage", "Performance"]]
+            for s in ranked:
+                pct = s.get('avg_score', s.get('percentage', 0))
+                perf = ReportGenerator._get_performance_category(pct)
+                rank_data.append([
+                    str(s.get('rank', '')),
+                    s.get('name', ''),
+                    f"{pct}%",
+                    f"{pct}%",
+                    perf,
+                ])
+            rt = Table(rank_data, colWidths=[0.5*inch, 2.5*inch, 0.9*inch, 1*inch, 1.3*inch])
+            rt.setStyle(header_style)
+            # Highlight top 3
+            for i in range(1, min(4, len(rank_data))):
+                rt.setStyle(TableStyle([
+                    ('BACKGROUND', (0, i), (-1, i), colors.HexColor('#d4edda')),
+                ]))
+            elements.append(rt)
+            elements.append(Spacer(1, 20))
+
         doc.build(elements)
         buffer.seek(0)
-        
+
+        safe_name = school_name.replace(' ', '_').replace('/', '_')[:30]
         response = HttpResponse(buffer, content_type='application/pdf')
-        response['Content-Disposition'] = f'attachment; filename=class_{grade}{section}_{timezone.now().date()}.pdf'
+        response['Content-Disposition'] = f'attachment; filename=analytics_{safe_name}_{source}_{timezone.now().date()}.pdf'
+        return response
+
+    @staticmethod
+    def generate_class_excel_report(report_data):
+        """Generate simplified class Excel report — single sheet with student ranking."""
+        import openpyxl
+        from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
+        from django.http import HttpResponse
+
+        wb = openpyxl.Workbook()
+        ws = wb.active
+
+        school_name = report_data.get('school_name', 'School')
+        class_name = report_data.get('class_name', '')
+        ranked_students = report_data.get('ranked_students', [])
+
+        ws.title = f"Class {class_name}"
+
+        # Header
+        ws['A1'] = f"Student Rankings — {school_name} — Class {class_name}"
+        ws['A1'].font = Font(size=14, bold=True)
+        ws.merge_cells('A1:E1')
+        ws['A2'] = f"Generated: {timezone.now().strftime('%Y-%m-%d %H:%M')}"
+        ws['A2'].font = Font(size=9, italic=True)
+
+        # Column Headers
+        headers = ["Rank", "Student Name", "Score", "Percentage", "Performance"]
+        header_fill = PatternFill(start_color="1a1a2e", end_color="1a1a2e", fill_type="solid")
+        header_font = Font(bold=True, color="FFFFFF", size=10)
+        thin_border = Border(
+            left=Side(style='thin'), right=Side(style='thin'),
+            top=Side(style='thin'), bottom=Side(style='thin'),
+        )
+
+        for col, h in enumerate(headers, 1):
+            cell = ws.cell(row=4, column=col, value=h)
+            cell.font = header_font
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal='center')
+            cell.border = thin_border
+
+        # Data rows
+        for i, s in enumerate(ranked_students):
+            row = 5 + i
+            pct = s.get('avg_score', s.get('percentage', 0))
+            perf = ReportGenerator._get_performance_category(pct)
+            ws.cell(row=row, column=1, value=s.get('rank', i + 1)).alignment = Alignment(horizontal='center')
+            ws.cell(row=row, column=2, value=s.get('name', ''))
+            ws.cell(row=row, column=3, value=f"{pct}%")
+            ws.cell(row=row, column=4, value=f"{pct}%")
+            ws.cell(row=row, column=5, value=perf)
+            for c in range(1, 6):
+                ws.cell(row=row, column=c).border = thin_border
+
+        # Column widths
+        widths = [8, 35, 12, 14, 20]
+        for i, w in enumerate(widths, 1):
+            ws.column_dimensions[get_column_letter(i)].width = w
+
+        response = HttpResponse(content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+        response['Content-Disposition'] = f'attachment; filename=class_{class_name}_{timezone.now().date()}.xlsx'
+        wb.save(response)
+        return response
+
+    @staticmethod
+    def generate_class_pdf_report(report_data):
+        """Generate professional class PDF report with charts and student ranking."""
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import letter
+        from reportlab.lib.units import inch
+        from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+        from django.http import HttpResponse
+        import io
+
+        buffer = io.BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=letter, topMargin=0.5*inch, bottomMargin=0.5*inch)
+        elements = []
+        styles, font_name, font_bold = ReportGenerator._get_unicode_styles()
+
+        source = report_data.get('source', 'exams')
+        school_name = report_data.get('school_name', '')
+        class_name = report_data.get('class_name', '')
+        stats = report_data.get('stats', {})
+
+        header_style = TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1a1a2e')),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
+            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+            ('FONTNAME', (0, 0), (-1, 0), font_bold),
+            ('FONTNAME', (0, 1), (-1, -1), font_name),
+            ('FONTSIZE', (0, 0), (-1, 0), 10),
+            ('BOTTOMPADDING', (0, 0), (-1, 0), 10),
+            ('TOPPADDING', (0, 0), (-1, 0), 10),
+            ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#f8f9fa')),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#dee2e6')),
+            ('FONTSIZE', (0, 1), (-1, -1), 9),
+            ('TOPPADDING', (0, 1), (-1, -1), 6),
+            ('BOTTOMPADDING', (0, 1), (-1, -1), 6),
+        ])
+
+        # ── Header Information ──
+        source_label = 'ZipGrade' if source == 'zipgrade' else 'Online Exams'
+        elements.append(Paragraph(f"Class Analytics Report", styles['Title']))
+        header_info = [
+            ["School", school_name],
+            ["Class", class_name],
+            ["Source", source_label],
+            ["Total Students", str(stats.get('total_students', 0))],
+            ["Average Score", f"{stats.get('avg_score', 0)}%"],
+            ["Pass Rate", f"{stats.get('pass_rate', 0)}%"],
+            ["Date Generated", timezone.now().strftime('%Y-%m-%d %H:%M')],
+        ]
+
+        ht = Table(header_info, colWidths=[2*inch, 4*inch])
+        ht.setStyle(TableStyle([
+            ('FONTNAME', (0, 0), (0, -1), font_bold),
+            ('FONTNAME', (1, 0), (1, -1), font_name),
+            ('FONTSIZE', (0, 0), (-1, -1), 10),
+            ('TOPPADDING', (0, 0), (-1, -1), 4),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+            ('LINEBELOW', (0, -1), (-1, -1), 1, colors.HexColor('#1a1a2e')),
+        ]))
+        elements.append(ht)
+        elements.append(Spacer(1, 25))
+
+        # ── Performance Distribution Chart ──
+        perf_dist = report_data.get('performance_distribution', {})
+        if perf_dist:
+            elements.append(Paragraph("Performance Distribution", styles['Heading2']))
+            pie_drawing = ReportGenerator._build_pie_chart(perf_dist, font_name)
+            if pie_drawing:
+                elements.append(pie_drawing)
+            elements.append(Spacer(1, 20))
+
+        # ── Best Performing Subjects Chart ──
+        subj_labels = report_data.get('subject_labels', [])
+        subj_data = report_data.get('subject_data', [])
+        if subj_labels and subj_data:
+            elements.append(Paragraph("Best Performing Subjects", styles['Heading2']))
+            bar_drawing = ReportGenerator._build_bar_chart(subj_labels, subj_data, font_name)
+            if bar_drawing:
+                elements.append(bar_drawing)
+            elements.append(Spacer(1, 20))
+
+        # ── Student Ranking Table ──
+        ranked = report_data.get('ranked_students', [])
+        if ranked:
+            elements.append(Paragraph("Student Rankings", styles['Heading2']))
+            rank_data = [["Rank", "Student Name", "Score", "Percentage", "Performance"]]
+            for s in ranked:
+                pct = s.get('avg_score', s.get('percentage', 0))
+                perf = ReportGenerator._get_performance_category(pct)
+                rank_data.append([
+                    str(s.get('rank', '')),
+                    s.get('name', ''),
+                    f"{pct}%",
+                    f"{pct}%",
+                    perf,
+                ])
+            rt = Table(rank_data, colWidths=[0.5*inch, 2.5*inch, 0.9*inch, 1*inch, 1.3*inch])
+            rt.setStyle(header_style)
+            for i in range(1, min(4, len(rank_data))):
+                rt.setStyle(TableStyle([
+                    ('BACKGROUND', (0, i), (-1, i), colors.HexColor('#d4edda')),
+                ]))
+            elements.append(rt)
+            elements.append(Spacer(1, 20))
+
+        doc.build(elements)
+        buffer.seek(0)
+
+        response = HttpResponse(buffer, content_type='application/pdf')
+        response['Content-Disposition'] = f'attachment; filename=class_{class_name}_{source}_{timezone.now().date()}.pdf'
         return response
 
     @staticmethod
@@ -946,7 +1343,6 @@ class ReportGenerator:
         from reportlab.lib import colors
         from reportlab.lib.pagesizes import letter
         from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
-        from reportlab.lib.styles import getSampleStyleSheet
         from django.http import HttpResponse
         from django.db.models import Avg, Max, Min
         import io
@@ -954,7 +1350,7 @@ class ReportGenerator:
         buffer = io.BytesIO()
         doc = SimpleDocTemplate(buffer, pagesize=letter)
         elements = []
-        styles = getSampleStyleSheet()
+        styles, font_name, font_bold = ReportGenerator._get_unicode_styles()
         
         # Title
         elements.append(Paragraph(f"Student Analytics Report: {student.get_full_name()}", styles['Title']))
@@ -991,7 +1387,7 @@ class ReportGenerator:
                 ('BACKGROUND', (0, 0), (1, 0), colors.grey),
                 ('TEXTCOLOR', (0, 0), (1, 0), colors.whitesmoke),
                 ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTNAME', (0, 0), (-1, 0), font_bold),
                 ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
                 ('BACKGROUND', (0, 1), (-1, -1), colors.beige),
                 ('GRID', (0, 0), (-1, -1), 1, colors.black),
@@ -1039,7 +1435,7 @@ class ReportGenerator:
                 ('BACKGROUND', (0, 0), (-1, 0), colors.grey),
                 ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
                 ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTNAME', (0, 0), (-1, 0), font_bold),
                 ('GRID', (0, 0), (-1, -1), 1, colors.black),
             ]))
             elements.append(t2)

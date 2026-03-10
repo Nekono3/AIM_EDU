@@ -264,6 +264,11 @@ def master_student_list_view(request):
     if grade_filter:
         students = students.filter(grade=grade_filter)
     
+    # Filter by class type
+    class_type_filter = request.GET.get('class_type', '')
+    if class_type_filter:
+        students = students.filter(class_type=class_type_filter)
+    
     # Pagination
     from django.core.paginator import Paginator
     paginator = Paginator(students, 50)
@@ -278,6 +283,7 @@ def master_student_list_view(request):
         'search': search,
         'school_filter': int(school_filter) if school_filter else '',
         'grade_filter': grade_filter,
+        'class_type_filter': class_type_filter,
         'schools': School.objects.filter(is_active=True),
         'grades': grades,
     }
@@ -297,12 +303,49 @@ def master_student_upload_view(request):
             replace_existing = form.cleaned_data['replace_existing']
             
             try:
-                # Parse Excel file
-                students_data = parse_master_student_excel(file)
+                # Parse Excel file — returns dict with metadata
+                result = parse_master_student_excel(file)
+                students_data = result['students']
                 
                 if not students_data:
                     messages.error(request, _('No valid student data found in the file.'))
                     return redirect('schools:master_student_upload')
+                
+                # Warn about invalid class_type values
+                if result['invalid_rows']:
+                    details = ', '.join(
+                        _('row %(row)d (ID: %(id)s, value: "%(val)s")') % {
+                            'row': r, 'id': sid, 'val': v
+                        }
+                        for r, v, sid in result['invalid_rows'][:10]
+                    )
+                    extra = ''
+                    if len(result['invalid_rows']) > 10:
+                        extra = _(' ...and %(count)d more') % {
+                            'count': len(result['invalid_rows']) - 10
+                        }
+                    messages.warning(
+                        request,
+                        _('%(count)d students had invalid or empty class_type values '
+                          '(defaulted to RU): %(details)s%(extra)s') % {
+                            'count': len(result['invalid_rows']),
+                            'details': details,
+                            'extra': extra,
+                        }
+                    )
+                
+                # Warn when no class_type column found (auto-detection used)
+                if not result['has_class_type_column']:
+                    messages.warning(
+                        request,
+                        _('No "class_type" column found in file. '
+                          'Types were auto-detected from section names: '
+                          '%(kg)d KG, %(ru)d RU. '
+                          'Please verify and edit manually if incorrect.') % {
+                            'kg': result['kg_count'],
+                            'ru': result['ru_count'],
+                        }
+                    )
                 
                 # Delete existing if requested
                 if replace_existing:
@@ -321,6 +364,7 @@ def master_student_upload_view(request):
                             'surname': data['surname'],
                             'grade': data['grade'],
                             'section': data['section'],
+                            'class_type': data['class_type'],
                         }
                     )
                     if created:
@@ -330,9 +374,12 @@ def master_student_upload_view(request):
                 
                 messages.success(
                     request,
-                    _('Import complete: %(created)d students created, %(updated)d updated.') % {
+                    _('Import complete: %(created)d created, %(updated)d updated '
+                      '(%(kg)d KG, %(ru)d RU).') % {
                         'created': created_count,
                         'updated': updated_count,
+                        'kg': result['kg_count'],
+                        'ru': result['ru_count'],
                     }
                 )
                 return redirect('schools:detail', pk=school.pk)

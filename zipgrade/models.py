@@ -68,6 +68,9 @@ class ZipGradeExam(models.Model):
     total_students = models.PositiveIntegerField(default=0, verbose_name=_('Total Students'))
     unknown_students = models.PositiveIntegerField(default=0, verbose_name=_('Unknown Students'))
     
+    # Answer key for calculating correct/incorrect (JSON: {"1": "A", "2": "B", ...})
+    answer_key = models.TextField(blank=True, verbose_name=_('Answer Key (JSON)'))
+    
     # Optional folder organization
     folder = models.ForeignKey(
         ExamFolder,
@@ -102,6 +105,12 @@ class ZipGradeExam(models.Model):
 class SubjectSplit(models.Model):
     """Defines how questions are split by subject in a ZipGrade exam."""
     
+    CLASS_TYPE_CHOICES = [
+        ('all', _('All Classes')),
+        ('ru', _('RU Classes Only')),
+        ('kg', _('KG Classes Only')),
+    ]
+    
     exam = models.ForeignKey(
         ZipGradeExam,
         on_delete=models.CASCADE,
@@ -127,17 +136,62 @@ class SubjectSplit(models.Model):
         verbose_name=_('Points per Question')
     )
     
+    # Class type filter — determines which students this split applies to
+    class_type = models.CharField(
+        max_length=5,
+        choices=CLASS_TYPE_CHOICES,
+        default='all',
+        verbose_name=_('Class Type'),
+        help_text=_('Restrict this split to specific class types. "All" applies to everyone.')
+    )
+
+    # Logical (display) range — optional remapping for analytics/UI
+    # When set, these override start/end_question for display purposes only.
+    # Scoring always uses the physical start/end_question.
+    # Example: RU split physical Q61-80, logical Q41-60 → displays as Q41-60 like the KG split.
+    logical_start_question = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        verbose_name=_('Display Start Q#'),
+        help_text=_('Optional: override display range for analytics. Leave blank to use physical range.')
+    )
+    logical_end_question = models.PositiveIntegerField(
+        null=True,
+        blank=True,
+        verbose_name=_('Display End Q#'),
+        help_text=_('Optional: override display range for analytics. Leave blank to use physical range.')
+    )
+    
     class Meta:
         verbose_name = _('Subject Split')
         verbose_name_plural = _('Subject Splits')
         ordering = ['start_question']
-        unique_together = ['exam', 'subject']
+
     
     def __str__(self):
-        return f"{self.subject.name}: Q{self.start_question}-Q{self.end_question}"
-    
+        suffix = ''
+        if self.class_type != 'all':
+            suffix = f' [{self.get_class_type_display()}]'
+        return f"{self.subject.name}: Q{self.display_start}-Q{self.display_end}{suffix}"
+
+    @property
+    def display_start(self):
+        """Start question to show in UI/analytics (logical override or physical)."""
+        return self.logical_start_question if self.logical_start_question is not None else self.start_question
+
+    @property
+    def display_end(self):
+        """End question to show in UI/analytics (logical override or physical)."""
+        return self.logical_end_question if self.logical_end_question is not None else self.end_question
+
+    @property
+    def display_count(self):
+        """Number of questions in the display range."""
+        return self.display_end - self.display_start + 1
+
     @property
     def question_count(self):
+        """Number of physical questions (used for scoring)."""
         return self.end_question - self.start_question + 1
     
     @property
@@ -178,6 +232,17 @@ class ExamResult(models.Model):
     # Answer data (JSON string of answers)
     answers = models.TextField(blank=True, verbose_name=_('Answers (JSON)'))
     
+    # Class-type-filtered percentage (calculated from applicable SubjectResults only)
+    # NULL when no class-type splits exist; analytics fall back to raw `percentage`.
+    class_type_percentage = models.DecimalField(
+        max_digits=5,
+        decimal_places=2,
+        null=True,
+        blank=True,
+        verbose_name=_('Class-Type Filtered %'),
+        help_text=_('Percentage based only on questions assigned to this student\'s class type (KG/RU).')
+    )
+
     # Unknown student flag
     is_unknown = models.BooleanField(default=False, verbose_name=_('Unknown Student'))
     

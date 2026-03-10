@@ -102,6 +102,7 @@ class ExamQuestion(models.Model):
     QUESTION_TYPES = [
         ('multiple_choice', _('Multiple Choice')),
         ('fill_blanks', _('Fill in the Blanks')),
+        ('matching', _('Matching')),
     ]
     
     exam = models.ForeignKey(
@@ -125,6 +126,7 @@ class ExamQuestion(models.Model):
         default='multiple_choice',
         verbose_name=_('Question Type')
     )
+
     
     points = models.PositiveIntegerField(default=1, verbose_name=_('Points'))
     order = models.PositiveIntegerField(default=0, verbose_name=_('Order'))
@@ -146,6 +148,37 @@ class ExamQuestion(models.Model):
     
     def __str__(self):
         return f"Q{self.order}: {self.question_text[:50]}"
+
+    @property
+    def shuffled_right_items(self):
+        """Return right items from matching pairs in shuffled order."""
+        import random
+        items = list(self.matching_pairs.values_list('right_item', flat=True))
+        random.shuffle(items)
+        return items
+
+
+class MatchingPair(models.Model):
+    """A left-right pair for a matching question."""
+    
+    question = models.ForeignKey(
+        ExamQuestion,
+        on_delete=models.CASCADE,
+        related_name='matching_pairs',
+        verbose_name=_('Question')
+    )
+    
+    left_item = models.CharField(max_length=500, verbose_name=_('Left Item (Column A)'))
+    right_item = models.CharField(max_length=500, verbose_name=_('Right Item (Column B)'))
+    order = models.PositiveIntegerField(default=0, verbose_name=_('Order'))
+    
+    class Meta:
+        verbose_name = _('Matching Pair')
+        verbose_name_plural = _('Matching Pairs')
+        ordering = ['order', 'id']
+    
+    def __str__(self):
+        return f"{self.left_item} ↔ {self.right_item}"
 
 
 class QuestionOption(models.Model):
@@ -291,6 +324,12 @@ class AttemptAnswer(models.Model):
     # For fill_blanks questions
     text_answer = models.TextField(blank=True, verbose_name=_('Text Answer'))
     
+    # For matching questions — stores student mappings as JSON
+    # Format: {"left_item": "selected_right_item", ...}
+    matching_answers = models.JSONField(
+        default=dict, blank=True, verbose_name=_('Matching Answers')
+    )
+    
     is_correct = models.BooleanField(default=False, verbose_name=_('Correct'))
     answered_at = models.DateTimeField(auto_now=True, verbose_name=_('Answered At'))
     
@@ -311,10 +350,29 @@ class AttemptAnswer(models.Model):
                 self.is_correct = self.text_answer.strip().lower() in correct_variants
             else:
                 self.is_correct = False
+        elif self.question.question_type == 'matching':
+            # Check matching answers against correct pairs
+            if self.matching_answers:
+                correct_pairs = {
+                    p.left_item.strip().lower(): p.right_item.strip().lower()
+                    for p in self.question.matching_pairs.all()
+                }
+                student_pairs = {
+                    k.strip().lower(): v.strip().lower()
+                    for k, v in self.matching_answers.items()
+                }
+                self.is_correct = student_pairs == correct_pairs
+            else:
+                self.is_correct = False
         elif self.selected_option:
             self.is_correct = self.selected_option.is_correct
         else:
             self.is_correct = False
+        # Ensure is_correct is persisted even when update_fields is specified
+        # (e.g. from update_or_create which only saves the defaults fields)
+        update_fields = kwargs.get('update_fields')
+        if update_fields is not None and 'is_correct' not in update_fields:
+            kwargs['update_fields'] = list(update_fields) + ['is_correct']
         super().save(*args, **kwargs)
 
 

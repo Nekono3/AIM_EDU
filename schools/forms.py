@@ -108,7 +108,7 @@ class MasterStudentForm(forms.ModelForm):
     
     class Meta:
         model = MasterStudent
-        fields = ['student_id', 'name', 'surname', 'grade', 'section']
+        fields = ['student_id', 'name', 'surname', 'grade', 'section', 'class_type']
         widgets = {
             'student_id': forms.TextInput(attrs={
                 'class': 'form-input',
@@ -129,5 +129,8 @@ class MasterStudentForm(forms.ModelForm):
             'section': forms.TextInput(attrs={
                 'class': 'form-input',
                 'placeholder': _('Section (e.g., A)'),
+            }),
+            'class_type': forms.Select(attrs={
+                'class': 'form-select',
             }),
         }

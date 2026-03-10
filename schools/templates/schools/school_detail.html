@@ -103,6 +103,7 @@
                     <th>{% trans "ID" %}</th>
                     <th>{% trans "Name" %}</th>
                     <th>{% trans "Class" %}</th>
+                    <th>{% trans "Type" %}</th>
                     <th style="width: 100px;"></th>
                 </tr>
             </thead>
@@ -112,6 +113,12 @@
                     <td><code>{{ student.student_id }}</code></td>
                     <td><strong>{{ student.surname }} {{ student.name }}</strong></td>
                     <td>{{ student.grade }}{{ student.section }}</td>
+                    <td>
+                        <span
+                            class="badge {% if student.class_type == 'kg' %}badge-warning{% else %}badge-info{% endif %}">
+                            {{ student.get_class_type_display }}
+                        </span>
+                    </td>
                     <td>
                         <div style="display: flex; gap: var(--spacing-xs);">
                             <a href="{% url 'schools:master_student_edit' student.pk %}" class="btn btn-sm btn-outline">
@@ -130,7 +137,7 @@
                 </tr>
                 {% empty %}
                 <tr>
-                    <td colspan="4" style="text-align: center; color: var(--text-muted); padding: var(--spacing-xl);">
+                    <td colspan="5" style="text-align: center; color: var(--text-muted); padding: var(--spacing-xl);">
                         {% trans "No students found." %}
                     </td>
                 </tr>
