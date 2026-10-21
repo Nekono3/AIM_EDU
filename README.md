@@ -1,8 +1,4 @@
 <div align="center">
-  <img src="./assets/banner.svg" alt="Banner" width="100%">
-</div>
-
-<div align="center">
 
 # 🎓 AIM EDU &mdash; Automated Examination & Academic Analytics Platform
 
