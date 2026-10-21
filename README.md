@@ -46,7 +46,7 @@ flowchart TD
         G --> H{Validation & Alignment}
         H -->|Verify Student ID| I[ID Normalization & Matcher]
         H -->|Key Mapping| J[Answer Matrix Scorer]
-        I --> K[(PostgreSQL / SQLite Storage)]
+        I --> K[("PostgreSQL / SQLite Storage")]
         J --> K
     end
 
